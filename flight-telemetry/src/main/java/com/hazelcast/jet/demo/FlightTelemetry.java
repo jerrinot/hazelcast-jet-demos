@@ -1,16 +1,24 @@
 package com.hazelcast.jet.demo;
 
+import com.hazelcast.config.MaxSizeConfig;
 import com.hazelcast.jet.IMapJet;
 import com.hazelcast.jet.Jet;
 import com.hazelcast.jet.JetInstance;
 import com.hazelcast.jet.Job;
+import com.hazelcast.jet.config.JetConfig;
+import com.hazelcast.jet.config.JobConfig;
+import com.hazelcast.jet.config.ProcessingGuarantee;
 import com.hazelcast.jet.datamodel.TimestampedEntry;
 import com.hazelcast.jet.demo.Aircraft.VerticalDirection;
 import com.hazelcast.jet.demo.types.WakeTurbulanceCategory;
+import com.hazelcast.jet.pipeline.JournalInitialPosition;
 import com.hazelcast.jet.pipeline.Pipeline;
 import com.hazelcast.jet.pipeline.Sink;
+import com.hazelcast.jet.pipeline.SinkStage;
 import com.hazelcast.jet.pipeline.Sinks;
 import com.hazelcast.jet.pipeline.SlidingWindowDef;
+import com.hazelcast.jet.pipeline.Sources;
+import com.hazelcast.jet.pipeline.StreamSource;
 import com.hazelcast.jet.pipeline.StreamStage;
 import com.hazelcast.jet.pipeline.WindowDefinition;
 import com.hazelcast.map.listener.EntryAddedListener;
@@ -43,6 +51,8 @@ import static com.hazelcast.jet.demo.util.Util.inNYC;
 import static com.hazelcast.jet.demo.util.Util.inParis;
 import static com.hazelcast.jet.demo.util.Util.inTokyo;
 import static com.hazelcast.jet.function.DistributedComparator.comparingInt;
+import static com.hazelcast.jet.pipeline.JournalInitialPosition.START_FROM_CURRENT;
+import static com.hazelcast.jet.pipeline.JournalInitialPosition.START_FROM_OLDEST;
 import static java.util.Collections.emptySortedMap;
 import static java.util.concurrent.TimeUnit.SECONDS;
 
@@ -104,28 +114,53 @@ import static java.util.concurrent.TimeUnit.SECONDS;
  *
  */
 public class FlightTelemetry {
+    public static final String JOB_NAME = "telemetry";
+    public static final String BUFFER_MAP = "myMap";
 
     private static final String SOURCE_URL = "https://public-api.adsbexchange.com/VirtualRadar/AircraftList.json";
     private static final String TAKE_OFF_MAP = "takeOffMap";
     private static final String LANDING_MAP = "landingMap";
+
 
     static {
         System.setProperty("hazelcast.logging.type", "log4j");
     }
 
     public static void main(String[] args) {
-        JetInstance jet = Jet.newJetInstance();
+        JetConfig jetConfig = ConfigUtils.buildConfig();
+
+        JetInstance jet = Jet.newJetInstance(jetConfig);
 
         Pipeline pipeline = buildPipeline();
-        addListener(jet.getMap(TAKE_OFF_MAP), a -> System.out.println("New aircraft taking off: " + a));
-        addListener(jet.getMap(LANDING_MAP), a -> System.out.println("New aircraft landing " + a));
+        JobConfig jobConfig = new JobConfig();
+        jobConfig.setName(JOB_NAME);
+        jobConfig.setProcessingGuarantee(ProcessingGuarantee.EXACTLY_ONCE);
+
+//        addListener(jet.getMap(TAKE_OFF_MAP), a -> System.out.println("New aircraft taking off: " + a));
+//        addListener(jet.getMap(LANDING_MAP), a -> System.out.println("New aircraft landing " + a));
+
+        Pipeline pump = buildPump();
 
         try {
-            Job job = jet.newJob(pipeline);
+            Job pumpJob = jet.newJob(pump);
+            Job job = jet.newJob(pipeline, jobConfig);
+
             job.join();
         } finally {
             Jet.shutdownAll();
         }
+    }
+
+    private static Pipeline buildPump() {
+        Pipeline p = Pipeline.create();
+
+        p
+                .drawFrom(streamAircraft(SOURCE_URL, 10000))
+//                .peek(e -> String.valueOf(e.id))
+                .map(a -> entry(a.getId(), a))
+                .drainTo(Sinks.map(BUFFER_MAP));
+
+        return p;
     }
 
     private static Pipeline buildPipeline() {
@@ -134,8 +169,12 @@ public class FlightTelemetry {
         Sink<Object> graphiteSink = GraphiteSink.sink("127.0.0.1", 2004);
 
         SlidingWindowDef slidingWindow = WindowDefinition.sliding(60_000, 30_000);
+
+        StreamSource<Entry<Long, Aircraft>> inMemoryBuffer = Sources.mapJournal(BUFFER_MAP, START_FROM_OLDEST);
+
         StreamStage<TimestampedEntry<Long, Aircraft>> flights = p
-                .drawFrom(streamAircraft(SOURCE_URL, 10000))
+                .drawFrom(inMemoryBuffer)
+                .map(Entry::getValue)
                 .addTimestamps(Aircraft::getPosTime, SECONDS.toMillis(15))
                 .filter(a -> !a.isGnd() && a.getAlt() > 0 && a.getAlt() < 3000)
                 .map(FlightTelemetry::assignAirport)
@@ -175,6 +214,7 @@ public class FlightTelemetry {
         // (airport, total_co2)
 
 
+//        p.drainTo(Sinks.logger(), co2Emission, maxNoise, landingFlights, takingOffFlights);
         p.drainTo(graphiteSink, co2Emission, maxNoise, landingFlights, takingOffFlights);
         return p;
     }

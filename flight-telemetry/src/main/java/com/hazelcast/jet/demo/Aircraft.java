@@ -432,6 +432,7 @@ public class Aircraft implements JsonSerializable, Serializable {
                 ", mdl='" + mdl + '\'' +
                 ", city='" + airport + '\'' +
                 ", posTime=" + Util.toLocalDateTime(posTime).toLocalTime() +
+                ", direction=" + verticalDirection +
                 '}';
     }
 
